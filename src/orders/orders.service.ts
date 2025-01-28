@@ -2,7 +2,7 @@ import { HttpStatus, Inject, Injectable, Logger, OnModuleInit } from "@nestjs/co
 import { PrismaClient } from "@prisma/client";
 import { ChangeOrderStatusDTO, CreateOrderDto, OrderPaginationDto } from "./dto";
 import { ClientProxy, RpcException } from "@nestjs/microservices";
-import { PRODUCT_SERVICE } from "../config/services";
+import { NATS_SERVICE } from "../config/services";
 import { firstValueFrom } from "rxjs";
 
 @Injectable()
@@ -10,7 +10,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
   private readonly logger = new Logger('OrdersService');
 
-  constructor(@Inject(PRODUCT_SERVICE) private readonly productsClient: ClientProxy) {
+  constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {
     super();
   }
 
@@ -25,7 +25,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       //1. Confirmar que los productos existan
       const productsIds = createOrderDto.items.map(item => item.productId)
       const products = await firstValueFrom(
-        this.productsClient.send({ cmd: 'validate_products' }, productsIds)
+        this.client.send({ cmd: 'validate_products' }, productsIds)
       )
 
       //2. Calculos de los valores
@@ -105,15 +105,45 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
   }
 
   async findOne(id: string) {
-    const order = await this.order.findUnique({ where: { id: id } });
-    console.log('Order: ', order);
-    if(!order) {
-      throw new RpcException({
-        message: `Product with id ${id} not found`,
-        status: HttpStatus.BAD_REQUEST,
+    try {
+      const order = await this.order.findUnique({
+        where: { id: id },
+        include: {
+          OrderItem: {
+            select: {
+              price: true,
+              quantity: true,
+              productId: true,
+            }
+          }
+        }
       });
+
+      if(!order) {
+        throw new RpcException({
+          message: `Product with id ${id} not found`,
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      const productsIds = order.OrderItem.map(orderItem => orderItem.productId);
+      const products = await firstValueFrom(
+        this.client.send({ cmd: 'validate_products' }, productsIds)
+      );
+
+      return {
+        ...order,
+        OrderItem: order.OrderItem.map((orderItem) => ({
+          ...orderItem,
+          name: products.find(product => product.id === orderItem.productId).name,
+        })),
+      };
+    } catch (error) {
+      throw new RpcException({
+        status: error.status ?? HttpStatus.BAD_REQUEST,
+        message: error.message ?? "Error in findOne - Orders"
+      })
     }
-    return order;
   }
 
   async changeStatus(changeOrderStatusDto: ChangeOrderStatusDTO) {
